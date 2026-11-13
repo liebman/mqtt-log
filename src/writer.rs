@@ -14,7 +14,7 @@ use rumqttc::AsyncClient;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
-use crate::config::{Output, RotationSettings, Topic};
+use crate::config::{Output, RotationSettings, Route, Topic};
 use crate::record::{Record, encode_line};
 use crate::sink::{Rotation, Sinks};
 use crate::stats::Counters;
@@ -23,6 +23,8 @@ pub struct WriterCfg {
     pub output: Output,
     pub rotation: RotationSettings,
     pub topics: Vec<Topic>,
+    /// Naming-only rules; they never reach the broker.
+    pub routes: Vec<Route>,
     pub flush_interval: Duration,
 }
 
@@ -44,11 +46,7 @@ pub async fn run(
             cfg.rotation.max_files,
         ))
     };
-    let templates: Vec<(String, Option<String>)> = cfg
-        .topics
-        .iter()
-        .map(|topic| (topic.filter.clone(), topic.out_file.clone()))
-        .collect();
+    let routing = Routing::new(&cfg.routes, &cfg.topics);
 
     let mut stdout = std::io::stdout();
     let mut ticker = tokio::time::interval(cfg.flush_interval);
@@ -65,7 +63,7 @@ pub async fn run(
                     &mut sinks,
                     &mut stdout,
                     &cfg.output,
-                    &templates,
+                    &routing,
                     &record,
                     &counters,
                 );
@@ -118,20 +116,14 @@ fn write_record(
     sinks: &mut Option<Sinks>,
     stdout: &mut std::io::Stdout,
     output: &Output,
-    templates: &[(String, Option<String>)],
+    routing: &Routing,
     record: &Record,
     counters: &Counters,
 ) {
     let line = encode_line(record, output.format, output.json);
 
     let outcome = match sinks {
-        Some(sinks) => {
-            let template = templates
-                .iter()
-                .find(|(filter, _)| crate::topic::matches(filter, record.topic()))
-                .and_then(|(_, template)| template.as_deref());
-            sinks.write(record.topic(), template, &line)
-        }
+        Some(sinks) => sinks.write(record.topic(), routing.template_for(record.topic()), &line),
         None => stdout.write_all(&line).and_then(|()| stdout.flush()),
     };
 
@@ -149,9 +141,133 @@ fn write_record(
     }
 }
 
+/// Which file name applies to a topic.
+///
+/// `[[routes]]` are consulted first: they are pure naming rules and are never
+/// subscribed, so overlapping them with `[[topics]]` cannot make the broker
+/// deliver a message twice. `[[topics]]` entries come next, in file order; a
+/// matching entry without an `out_file` deliberately stops the search and means
+/// "use the [output] default", which is what the config has always done.
+struct Routing {
+    rules: Vec<(String, Option<String>)>,
+}
+
+impl Routing {
+    fn new(routes: &[Route], topics: &[Topic]) -> Self {
+        let mut rules = Vec::with_capacity(routes.len() + topics.len());
+        rules.extend(
+            routes
+                .iter()
+                .map(|route| (route.filter.clone(), Some(route.out_file.clone()))),
+        );
+        rules.extend(
+            topics
+                .iter()
+                .map(|topic| (topic.filter.clone(), topic.out_file.clone())),
+        );
+        Self { rules }
+    }
+
+    fn template_for<'a>(&'a self, topic: &str) -> Option<&'a str> {
+        self.rules
+            .iter()
+            .find(|(filter, _)| crate::topic::matches(filter, topic))
+            .and_then(|(_, template)| template.as_deref())
+    }
+}
+
 async fn recv_hangup(hangup: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
     match hangup {
         Some(rx) => rx.recv().await,
         None => std::future::pending::<Option<()>>().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn topic(filter: &str, out_file: Option<&str>) -> Topic {
+        Topic {
+            filter: filter.to_string(),
+            qos: 0,
+            out_file: out_file.map(str::to_string),
+        }
+    }
+
+    fn route(filter: &str, out_file: &str) -> Route {
+        Route {
+            filter: filter.to_string(),
+            out_file: out_file.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_route_beats_the_topic_template_and_the_default() {
+        let routes = [route(
+            "logs/matrix-clock-806599ba7cb0",
+            "matrix-clock-s3.log",
+        )];
+        let topics = [topic("logs/#", Some("{topic}.log"))];
+        let routing = Routing::new(&routes, &topics);
+
+        assert_eq!(
+            routing.template_for("logs/matrix-clock-806599ba7cb0"),
+            Some("matrix-clock-s3.log")
+        );
+        assert_eq!(routing.template_for("logs/other"), Some("{topic}.log"));
+    }
+
+    #[test]
+    fn routes_are_consulted_before_topics() {
+        let routes = [route("logs/a", "route.log")];
+        let topics = [topic("logs/#", Some("everything.log"))];
+        let routing = Routing::new(&routes, &topics);
+
+        assert_eq!(routing.template_for("logs/a"), Some("route.log"));
+        assert_eq!(routing.template_for("logs/b"), Some("everything.log"));
+    }
+
+    #[test]
+    fn the_first_matching_rule_wins() {
+        let routing = Routing::new(
+            &[
+                route("logs/device", "exact.log"),
+                route("logs/device/#", "sub.log"),
+            ],
+            &[],
+        );
+
+        assert_eq!(routing.template_for("logs/device"), Some("exact.log"));
+        assert_eq!(routing.template_for("logs/device/metrics"), Some("sub.log"));
+    }
+
+    #[test]
+    fn a_wildcard_route_covers_the_bare_topic_and_its_children() {
+        let routing = Routing::new(&[route("logs/device/#", "device.log")], &[]);
+
+        assert_eq!(routing.template_for("logs/device"), Some("device.log"));
+        assert_eq!(
+            routing.template_for("logs/device/metrics"),
+            Some("device.log")
+        );
+    }
+
+    #[test]
+    fn a_matching_topic_entry_without_a_name_means_the_output_default() {
+        let topics = [
+            topic("app/#", None),
+            topic("app/special", Some("special.log")),
+        ];
+        let routing = Routing::new(&[], &topics);
+
+        assert_eq!(routing.template_for("app/special"), None);
+    }
+
+    #[test]
+    fn unmatched_topics_fall_through_to_the_default() {
+        let routing = Routing::new(&[], &[topic("app/#", Some("app.log"))]);
+
+        assert_eq!(routing.template_for("other/thing"), None);
     }
 }

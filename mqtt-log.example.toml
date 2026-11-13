@@ -24,6 +24,13 @@ filter   = "sensors/+/log"
 qos      = 0
 out_file = "{topic}.log"    # -> sensors_kitchen_log.log
 
+# Naming-only rules. Routes are never subscribed, so unlike an overlapping
+# [[topics]] entry they cannot make the broker deliver a message twice.
+# First matching rule wins; anything unmatched keeps the [output] file name.
+# [[routes]]
+# filter   = "sensors/kitchen/#"
+# out_file = "kitchen.log"
+
 [output]
 dir    = "logs"
 format = "jsonl"            # "jsonl" (envelope + metadata) or "raw" (verbatim payload)

@@ -193,6 +193,47 @@ paths and `..` are rejected.
 `--stdout` writes the payload lane to standard output instead, which composes
 nicely with `jq` and `tee`.
 
+### Naming files per topic
+
+`[[topics]] out_file` is per *subscription*, and every `[[topics]]` entry is also
+subscribed. Adding an override above a wildcard (`logs/#`) therefore creates two
+overlapping subscriptions, and MQTT delivers **one copy per matching
+subscription** — both copies land in the override file:
+
+```
+{"recv_ts":"...T22:46:41.029Z","topic":"logs/device-a",...,"payload":"heartbeat"}
+{"recv_ts":"...T22:46:41.029Z","topic":"logs/device-a",...,"payload":"heartbeat"}
+```
+
+`[[routes]]` avoids that. A route is a pure naming rule: the writer consults it,
+the broker never sees it, so `logs/#` can stay the only subscription.
+
+```toml
+[[topics]]                                  # the only subscription
+filter   = "logs/#"
+qos      = 0
+out_file = "{topic}.log"                    # fallback for unrouted topics
+
+[[routes]]                                  # naming only, never subscribed
+filter   = "logs/matrix-clock-806599ba7cb0"
+out_file = "matrix-clock-s3.log"
+
+[[routes]]
+filter   = "logs/matrix-clock-404cca429418"
+out_file = "matrix-clock-c6.log"
+```
+
+Resolution order, first match wins:
+
+1. `[[routes]]`, in file order;
+2. `[[topics]]` entries that set `out_file`, in file order;
+3. `[output] out_file` (default `app.log`).
+
+A `[[topics]]` entry that matches but sets no `out_file` still stops the search
+and falls back to `[output]`, so older configs keep behaving as they always did.
+Route filters are validated like subscriptions, and route templates like
+`--out-file` (no absolute paths, no `..`, `{topic}` allowed). A wildcard route
+such as `logs/device/#` covers both `logs/device` and its children.
 
 ## Known limitations
 

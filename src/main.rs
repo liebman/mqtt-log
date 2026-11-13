@@ -49,6 +49,11 @@ async fn run(settings: Settings, check: bool) -> Result<()> {
     tracing::info!(
         broker = %settings.broker.url,
         topics = ?settings.topics.iter().map(|t| t.filter.as_str()).collect::<Vec<_>>(),
+        routes = ?settings
+            .routes
+            .iter()
+            .map(|route| format!("{} -> {}", route.filter, route.out_file))
+            .collect::<Vec<_>>(),
         output = if settings.output.stdout {
             "stdout".to_string()
         } else {
@@ -84,6 +89,7 @@ async fn run(settings: Settings, check: bool) -> Result<()> {
         output: settings.output.clone(),
         rotation: settings.rotation.clone(),
         topics: settings.topics.clone(),
+        routes: settings.routes.clone(),
         flush_interval: settings.runtime.flush_interval,
     };
     let writer_task = tokio::spawn(writer::run(rx, writer_cfg, acker, hangup, counters.clone()));

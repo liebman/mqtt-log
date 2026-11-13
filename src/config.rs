@@ -148,6 +148,7 @@ impl<'de> Deserialize<'de> for Schedule {
 pub struct Config {
     pub broker: BrokerCfg,
     pub topics: Vec<TopicCfg>,
+    pub routes: Vec<RouteCfg>,
     pub output: OutputCfg,
     pub rotation: RotationCfg,
     pub runtime: RuntimeCfg,
@@ -173,6 +174,15 @@ pub struct BrokerCfg {
 pub struct TopicCfg {
     pub filter: Option<String>,
     pub qos: Option<u8>,
+    pub out_file: Option<String>,
+}
+
+/// A naming rule that never subscribes: it only feeds the writer's lookup, so
+/// overlapping filters cannot cause duplicate delivery.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RouteCfg {
+    pub filter: Option<String>,
     pub out_file: Option<String>,
 }
 
@@ -234,6 +244,7 @@ pub struct AppLogCfg {
 pub struct Settings {
     pub broker: Broker,
     pub topics: Vec<Topic>,
+    pub routes: Vec<Route>,
     pub output: Output,
     pub rotation: RotationSettings,
     pub runtime: ResolvedRuntime,
@@ -260,6 +271,14 @@ pub struct Topic {
     pub filter: String,
     pub qos: u8,
     pub out_file: Option<String>,
+}
+
+/// A resolved routing rule: `filter` is matched against each message's topic and
+/// `out_file` names the file. Routes are never handed to the broker.
+#[derive(Debug, Clone)]
+pub struct Route {
+    pub filter: String,
+    pub out_file: String,
 }
 
 #[derive(Debug, Clone)]
@@ -563,6 +582,18 @@ impl Settings {
             });
         }
 
+        let mut routes = Vec::with_capacity(file.routes.len());
+        for entry in &file.routes {
+            let filter = entry
+                .filter
+                .clone()
+                .context("each `[[routes]]` entry needs a `filter`")?;
+            let out_file = entry.out_file.clone().context(
+                "each `[[routes]]` entry needs an `out_file`; a nameless route does nothing",
+            )?;
+            routes.push(Route { filter, out_file });
+        }
+
         let output = Output {
             dir: args
                 .output
@@ -658,6 +689,7 @@ impl Settings {
         Ok(Self {
             broker,
             topics,
+            routes,
             output,
             rotation,
             runtime,
@@ -687,6 +719,12 @@ impl Settings {
             if let Some(template) = &topic.out_file {
                 validate_template(template)?;
             }
+        }
+
+        for route in &self.routes {
+            topic::validate_filter(&route.filter)
+                .map_err(|e| anyhow::anyhow!("invalid route filter: {e}"))?;
+            validate_template(&route.out_file)?;
         }
 
         if self.rotation.max_files == 0 {
@@ -756,6 +794,14 @@ impl Settings {
                     out_file: topic.out_file.clone(),
                 })
                 .collect(),
+            routes: self
+                .routes
+                .iter()
+                .map(|route| RouteCfg {
+                    filter: Some(route.filter.clone()),
+                    out_file: Some(route.out_file.clone()),
+                })
+                .collect(),
             output: OutputCfg {
                 dir: Some(self.output.dir.clone()),
                 out_file: Some(self.output.out_file.clone()),
@@ -811,6 +857,7 @@ mod tests {
         assert!(!settings.broker.clean_session, "persistent by default");
         assert_eq!(settings.broker.keep_alive, Duration::from_secs(30));
         assert_eq!(settings.topics.len(), 1);
+        assert!(settings.routes.is_empty());
         assert_eq!(settings.topics[0].qos, 1);
         assert_eq!(settings.output.dir, PathBuf::from("logs"));
         assert_eq!(settings.output.out_file, "app.log");
@@ -1059,7 +1106,11 @@ mod tests {
             "--client-id",
             "recv-1",
         ]);
-        let settings = Settings::merge(None, &args, None).unwrap();
+        let mut settings = Settings::merge(None, &args, None).unwrap();
+        settings.routes.push(Route {
+            filter: "logs/device".to_string(),
+            out_file: "device.log".to_string(),
+        });
         settings.validate().unwrap();
 
         let rendered = settings.to_toml(true).unwrap();
@@ -1083,6 +1134,9 @@ mod tests {
         );
         assert_eq!(reparsed.runtime.ack_after_write, Some(true));
         assert_eq!(reparsed.topics[0].filter.as_deref(), Some("app/#"));
+        assert_eq!(reparsed.routes.len(), 1, "{rendered}");
+        assert_eq!(reparsed.routes[0].filter.as_deref(), Some("logs/device"));
+        assert_eq!(reparsed.routes[0].out_file.as_deref(), Some("device.log"));
 
         let size = reparsed.rotation.max_size.expect("max size kept");
         assert_eq!(size.as_u64(), settings.rotation.max_size.unwrap());
@@ -1207,5 +1261,103 @@ mod tests {
         assert!(load(&path, false, &mut warnings).is_ok());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("rotation.max_file"), "{warnings:?}");
+    }
+
+    #[test]
+    fn routes_are_merged_in_file_order() {
+        let file = Config {
+            routes: vec![
+                RouteCfg {
+                    filter: Some("logs/matrix-clock-806599ba7cb0".to_string()),
+                    out_file: Some("matrix-clock-s3.log".to_string()),
+                },
+                RouteCfg {
+                    filter: Some("logs/matrix-clock-404cca429418".to_string()),
+                    out_file: Some("matrix-clock-c6.log".to_string()),
+                },
+            ],
+            ..Config::default()
+        };
+
+        let settings = merged(&["-t", "logs/#"], Some(file));
+        settings.validate().unwrap();
+
+        let routes: Vec<(&str, &str)> = settings
+            .routes
+            .iter()
+            .map(|route| (route.filter.as_str(), route.out_file.as_str()))
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                ("logs/matrix-clock-806599ba7cb0", "matrix-clock-s3.log"),
+                ("logs/matrix-clock-404cca429418", "matrix-clock-c6.log"),
+            ]
+        );
+        assert_eq!(settings.topics.len(), 1, "routes never subscribe");
+    }
+
+    #[test]
+    fn a_route_without_an_out_file_is_rejected() {
+        let file = Config {
+            routes: vec![RouteCfg {
+                filter: Some("logs/a".to_string()),
+                out_file: None,
+            }],
+            ..Config::default()
+        };
+
+        let error = Settings::merge(Some(&file), &parse(&["-t", "logs/#"]), None).unwrap_err();
+        assert!(error.to_string().contains("needs an `out_file`"), "{error}");
+    }
+
+    #[test]
+    fn a_route_without_a_filter_is_rejected() {
+        let file = Config {
+            routes: vec![RouteCfg {
+                filter: None,
+                out_file: Some("a.log".to_string()),
+            }],
+            ..Config::default()
+        };
+
+        let error = Settings::merge(Some(&file), &parse(&["-t", "logs/#"]), None).unwrap_err();
+        assert!(error.to_string().contains("needs a `filter`"), "{error}");
+    }
+
+    #[test]
+    fn route_templates_cannot_escape_the_output_directory() {
+        let file = Config {
+            routes: vec![RouteCfg {
+                filter: Some("logs/a".to_string()),
+                out_file: Some("../a.log".to_string()),
+            }],
+            ..Config::default()
+        };
+
+        let settings = Settings::merge(Some(&file), &parse(&["-t", "logs/#"]), None).unwrap();
+        let error = settings.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("must not contain `..`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn route_filters_are_validated_like_subscriptions() {
+        let file = Config {
+            routes: vec![RouteCfg {
+                filter: Some("logs/#/x".to_string()),
+                out_file: Some("x.log".to_string()),
+            }],
+            ..Config::default()
+        };
+
+        let settings = Settings::merge(Some(&file), &parse(&["-t", "logs/#"]), None).unwrap();
+        let error = settings.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("invalid route filter"),
+            "{error}"
+        );
     }
 }
