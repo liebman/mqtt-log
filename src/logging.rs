@@ -86,7 +86,14 @@ struct SinkGuard<'a>(MutexGuard<'a, Sink>);
 
 impl Write for SinkGuard<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        // `rolling-file` wraps its file in an 8 KiB `BufWriter`, and the
+        // subscriber registered as the process-global default is never dropped,
+        // so nothing would ever flush this sink: diagnostics would sit in the
+        // buffer until it happened to fill up. Log lines are rare, so pay for a
+        // flush here and keep the file truthful.
+        let written = self.0.write(buf)?;
+        self.0.flush()?;
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
