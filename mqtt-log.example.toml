@@ -1,0 +1,48 @@
+# Copy to ./mqtt-log.toml, or to /etc/mqtt-log/config.toml, and edit.
+# Every field is optional; anything left out falls back to the built-in default.
+# Run `mqtt-log --print-config` to see the fully merged result.
+
+[broker]
+url           = "mqtt://localhost:1883"   # or mqtts://host:8883
+client_id     = "mqtt-log"                # keep it stable across restarts
+clean_session = false                     # false + fixed id => broker queues while down
+keep_alive    = "30s"
+# username     = "logrecvr"
+# password     = "inline-is-supported-but-not-recommended"
+# password_file = "/run/secrets/mqtt-pass"
+# ca_file      = "/etc/ssl/certs/broker.pem"   # mqtts only
+
+# Per-topic settings (qos and output routing) are only available in this file.
+# Filters are passed to the broker as-is, so + and # work as usual.
+[[topics]]
+filter   = "app/#"
+qos      = 1
+out_file = "app.log"
+
+[[topics]]
+filter   = "sensors/+/log"
+qos      = 0
+out_file = "{topic}.log"    # -> sensors_kitchen_log.log
+
+[output]
+dir    = "logs"
+format = "jsonl"            # "jsonl" (envelope + metadata) or "raw" (verbatim payload)
+json   = "auto"             # "auto" | "always" | "never"
+stdout = false              # true writes the payload lane to stdout instead of files
+
+[rotation]
+schedule  = "never"         # "never" | "hourly" | "daily" | any duration ("15m")
+max_size  = "100MB"         # "512KiB", "1.5GB" or a plain byte count
+max_files = 9               # rotated files kept: app.log.1 .. app.log.9
+
+[runtime]
+queue_capacity   = 10000
+on_full          = "block"  # "block" (backpressure, no loss) or "drop"
+flush_interval   = "1s"
+ack_after_write  = false    # true => acknowledge only after the record is on disk
+reopen_on_sighup = true     # SIGHUP rotates the open files, logrotate style
+stats_interval   = "30s"
+
+[app_log]
+level = "info"              # mqtt-log's own diagnostics, never the payloads
+# file = "/var/log/mqtt-log/mqtt-log.log"
